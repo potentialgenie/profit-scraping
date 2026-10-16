@@ -1,20 +1,18 @@
 {
   "manifest_version": 3,
-  "name": "Upwork Client Lead Finder",
-  "version": "2.0",
-  "description": "Scans Upwork job search results and surfaces the posts that reveal the client's company or contact details.",
+  "name": "Upwork Vietnam History",
+  "version": "3.0",
+  "description": "Finds Upwork jobs that ask for Vietnam or whose clients have hired a freelancer there, including new posts.",
   "permissions": ["storage", "tabs", "alarms"],
   "host_permissions": [
-    "https://www.upwork.com/*",
-    "https://generativelanguage.googleapis.com/*",
-    "https://api.openai.com/*"
+    "https://www.upwork.com/*"
   ],
   "background": {
     "service_worker": "background.js"
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Upwork Client Lead Finder"
+    "default_title": "Upwork Vietnam History"
   },
   "options_ui": {
     "page": "leads.html",
@@ -23,7 +21,7 @@
   "content_scripts": [
     {
       "matches": ["https://www.upwork.com/nx/search/jobs*"],
-      "js": ["doc-extract.js", "search-content.js"],
+      "js": ["history-parse.js", "search-content.js"],
       "run_at": "document_idle"
     }
   ],

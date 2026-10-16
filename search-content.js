@@ -27,6 +27,7 @@
   /** Everything seen in this document, keyed by job id. */
   const captured = new Map();
   let scraping = false;
+  let stopRequested = false;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const jitter = () => ENRICH_MIN_MS + Math.random() * (ENRICH_MAX_MS - ENRICH_MIN_MS);
@@ -230,9 +231,9 @@
   }
 
   // ─── Client work history ────────────────────────────────────
-  // The feedback a client leaves and receives names them far more often than
-  // the posting does — "Thanks, Katsiaryna" in a review is an identity the job
-  // text never gives up. So capture that section too and let the model read it.
+  // Each row links the freelancer the client hired. The profile page is where
+  // their location is printed, so the names are collected here and resolved
+  // below. The text is kept for the detail drawer.
 
   const MAX_HISTORY_ENTRIES = 15;
   const MAX_HISTORY_CHARS = 6000;
@@ -334,97 +335,32 @@
     return text.length > MAX_HISTORY_CHARS ? `${text.slice(0, MAX_HISTORY_CHARS)}\n…[more history omitted]…` : text;
   }
 
-  // ─── Attachments ────────────────────────────────────────────
-  // Briefs attached to a post routinely carry the letterhead the post itself
-  // omits, so each file gets fetched and read (see doc-extract.js).
+  // ─── Freelancer locations ───────────────────────────────────
+  // History names the person. The country is on their profile, in the same
+  // place you see after clicking "To freelancer". Profiles repeat across jobs,
+  // so a location we already read is reused for the rest of the scrape.
 
-  const MAX_ATTACHMENTS = 3;
-  const ATTACHMENT_KEYS = ['attachments', 'jobAttachments', 'files'];
-  const ATTACHMENT_HREF = /\/(attachments?|download)\//i;
+  const PROFILE_CACHE_KEY = 'freelancerCache';
+  const PROFILE_CACHE_MS = 14 * 24 * 60 * 60 * 1000;
 
-  function attachmentName(entry) {
-    for (const key of ['name', 'fileName', 'filename', 'title', 'originalName']) {
-      const v = entry[key];
-      if (typeof v === 'string' && v.trim()) return v.trim();
+  async function loadProfileCache() {
+    const stored = await chrome.storage.local.get(PROFILE_CACHE_KEY);
+    const all = stored[PROFILE_CACHE_KEY] || {};
+    const now = Date.now();
+    const map = new Map();
+    for (const [url, row] of Object.entries(all)) {
+      if (!row || !row.checkedAt || now - row.checkedAt > PROFILE_CACHE_MS) continue;
+      map.set(url, row);
     }
-    return null;
+    return map;
   }
 
-  function attachmentUrl(entry) {
-    for (const key of ['link', 'url', 'downloadUrl', 'href', 'path']) {
-      const v = entry[key];
-      if (typeof v === 'string' && v.trim()) {
-        try { return new URL(v, 'https://www.upwork.com').href; } catch { /* unusable */ }
-      }
+  function saveProfileCache(map) {
+    const obj = {};
+    for (const [url, row] of map) {
+      if (row && row.checkedAt && !row.error) obj[url] = row;
     }
-    return null;
-  }
-
-  function attachmentsFromJson(html) {
-    for (const key of ATTACHMENT_KEYS) {
-      const marker = html.indexOf(`"${key}":[`);
-      if (marker === -1) continue;
-      const slice = balancedJsonAt(html, marker + key.length + 3);
-      if (!slice) continue;
-      let entries;
-      try { entries = JSON.parse(slice); } catch { continue; }
-      if (!Array.isArray(entries) || !entries.length) continue;
-
-      const out = [];
-      for (const entry of entries) {
-        if (!entry || typeof entry !== 'object') continue;
-        const name = attachmentName(entry);
-        const url = attachmentUrl(entry);
-        if (name || url) out.push({ name: name || 'attachment', url });
-      }
-      if (out.length) return out;
-    }
-    return [];
-  }
-
-  function attachmentsFromDom(doc) {
-    const out = [];
-    for (const a of doc.querySelectorAll('a[href]')) {
-      const href = a.getAttribute('href') || '';
-      if (!ATTACHMENT_HREF.test(href) && !a.hasAttribute('download')) continue;
-      let url;
-      try { url = new URL(href, 'https://www.upwork.com').href; } catch { continue; }
-      const name = (a.getAttribute('download') || a.textContent || '').trim();
-      out.push({ name: name || 'attachment', url });
-    }
-    return out;
-  }
-
-  function attachmentsFromHtml(html, doc) {
-    const found = attachmentsFromJson(html);
-    const all = found.length || !doc ? found : attachmentsFromDom(doc);
-    // Entries we can't fetch are still kept: a file named after the client
-    // identifies them whether or not its contents are reachable.
-    const seen = new Set();
-    return all
-      .filter((a) => {
-        const key = a.url || a.name;
-        return key && !seen.has(key) && seen.add(key);
-      })
-      .slice(0, MAX_ATTACHMENTS);
-  }
-
-  /** Read each attachment, keeping the filename even when the text won't parse. */
-  async function readAttachments(list, onProgress) {
-    const out = [];
-    for (const item of list) {
-      if (!scraping) break;
-      if (!item.url) { out.push({ name: item.name, text: '' }); continue; }
-      let text = '';
-      try {
-        text = await globalThis.extractAttachmentText(item.url);
-      } catch (err) {
-        onProgress && onProgress(`Attachment "${item.name}" unreadable (${err.message})`);
-      }
-      out.push({ name: item.name, text });
-      await sleep(jitter());
-    }
-    return out;
+    return chrome.storage.local.set({ [PROFILE_CACHE_KEY]: obj });
   }
 
   async function fetchJobDetail(job) {
@@ -433,52 +369,150 @@
     const html = await res.text();
     if (/just a moment|cdn-cgi\/challenge/i.test(html)) throw new Error('Cloudflare challenge');
 
-    const description = descriptionFromHtml(html);
-    if (!description) throw new Error('description not found in page');
-
+    const description = descriptionFromHtml(html) || '';
+    const title = titleFromHtml(html);
     let doc = null;
     try { doc = new DOMParser().parseFromString(html, 'text/html'); } catch { /* malformed */ }
+    const freelancers = globalThis.HistoryParse.freelancersFromJobHtml(html);
+    const preferred = globalThis.HistoryParse.preferredCountriesFromJobHtml(html);
+    const clientHistory = clientHistoryFromHtml(html, doc);
+    if (!description && !freelancers.length && !clientHistory && !preferred.countries.length) {
+      throw new Error('job page had no client history');
+    }
     return {
       description,
-      clientHistory: clientHistoryFromHtml(html, doc),
-      attachments: attachmentsFromHtml(html, doc),
+      title,
+      clientHistory,
+      freelancers,
+      preferredCountries: preferred.countries,
+      locationMatch: preferred.vietnam === true,
     };
   }
 
-  async function enrichAll(jobs, onProgress, withAttachments) {
+  function titleFromHtml(html) {
+    const og = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)
+      || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i);
+    const raw = (og && og[1]) || (html.match(/<title>([^<]+)<\/title>/i) || [])[1] || '';
+    const text = raw.replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
+    if (!text) return null;
+    return text.replace(/\s+[-|–—].*$/, '').trim() || null;
+  }
+
+  async function resolveFreelancers(people, cache, onProgress) {
+    const out = [];
+    let challenges = 0;
+
+    for (const person of people) {
+      if (!scraping || stopRequested) break;
+      const hit = cache.get(person.url);
+      if (hit) {
+        out.push({ ...hit, name: person.name || hit.name, url: person.url });
+        continue;
+      }
+
+      onProgress(`Opening ${person.name}'s profile…`);
+      try {
+        const res = await fetch(person.url, { credentials: 'include', headers: { accept: 'text/html' } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const html = await res.text();
+        if (/just a moment|cdn-cgi\/challenge/i.test(html)) throw new Error('Cloudflare challenge');
+        const loc = globalThis.HistoryParse.locationFromProfileHtml(html);
+        const row = {
+          name: person.name,
+          url: person.url,
+          location: loc.label,
+          country: loc.country,
+          vietnam: loc.vietnam === true,
+          checkedAt: Date.now(),
+        };
+        cache.set(person.url, row);
+        out.push(row);
+        challenges = 0;
+      } catch (err) {
+        const message = String(err && err.message ? err.message : err);
+        out.push({
+          name: person.name,
+          url: person.url,
+          location: null,
+          country: null,
+          vietnam: false,
+          error: message,
+        });
+        if (/Cloudflare challenge/i.test(message) && ++challenges >= 3) {
+          onProgress('Upwork blocked profile checks. Saving the jobs already checked.');
+          break;
+        }
+      }
+      await sleep(jitter());
+    }
+    return { people: out, blocked: challenges >= 3 };
+  }
+
+  async function enrichAll(jobs, onProgress) {
     let attempted = 0;
     let succeeded = 0;
     let failed = 0;
+    let blocked = false;
+    const cache = await loadProfileCache();
 
     for (const job of jobs) {
-      if (!scraping) break;
+      if (!scraping || stopRequested) break;
       try {
         const detail = await fetchJobDetail(job);
         if (detail.description.length > (job.description || '').length) {
           job.description = detail.description;
           job.truncated = false;
         }
+        if (detail.title && (!job.title || job.title === 'New job')) job.title = detail.title;
         if (detail.clientHistory) job.clientHistory = detail.clientHistory;
-        if (detail.attachments.length) {
-          job.attachments = withAttachments
-            ? await readAttachments(detail.attachments, onProgress)
-            : detail.attachments.map((a) => ({ name: a.name, text: '' }));
+        job.preferredCountries = detail.preferredCountries || [];
+        job.locationMatch = detail.locationMatch === true;
+        // The client already asked for Vietnam, so the freelancer profiles are
+        // not needed to decide whether this job link is kept.
+        if (job.locationMatch) {
+          job.freelancers = [];
+          job.checked = true;
+          job.checkError = null;
+          succeeded++;
+        } else {
+          const resolved = detail.freelancers.length
+            ? await resolveFreelancers(detail.freelancers, cache, onProgress)
+            : { people: [], blocked: false };
+          job.freelancers = resolved.people;
+          job.checked = true;
+          job.checkError = null;
+          succeeded++;
+          if (resolved.blocked) blocked = true;
         }
-        succeeded++;
       } catch (err) {
         failed++;
+        job.checked = false;
+        job.checkError = String(err && err.message ? err.message : err);
         // The odd failure is normal — deleted posts, private jobs. Five with
         // nothing getting through means Cloudflare is blocking us, and every
         // further request just deepens the hole.
         if (failed >= 5 && succeeded === 0) {
-          onProgress(`Full-text fetch blocked (${err.message}) — using search snippets`);
-          return;
+          onProgress(`Job pages blocked (${job.checkError}). Try again once the search results are visible.`);
+          blocked = true;
         }
       }
       attempted++;
-      onProgress(`Reading job ${attempted} of ${jobs.length}…`);
+      if (job.checked === false) {
+        onProgress(`Job ${attempted} of ${jobs.length} · couldn't open the job page`);
+      } else if (job.locationMatch) {
+        onProgress(`Job ${attempted} of ${jobs.length} · asked for ${(job.preferredCountries || []).join(', ')}`);
+      } else {
+        const matched = (job.freelancers || []).filter((f) => f.vietnam).map((f) => f.name);
+        onProgress(matched.length
+          ? `Job ${attempted} of ${jobs.length} · ${matched.join(', ')} in Vietnam`
+          : `Job ${attempted} of ${jobs.length} · no Vietnam match`);
+      }
+      if (blocked) break;
       await sleep(jitter());
     }
+
+    await saveProfileCache(cache);
+    return blocked;
   }
 
   // ─── Progress, published to storage ─────────────────────────
@@ -505,65 +539,131 @@
     return false;
   }
 
-  async function scrapePage(enrich, readAttachmentsEnabled) {
-    if (scraping) return;
-    scraping = true;
-    const status = (message) => setState({ active: true, message });
+  const CIPHER_ID_RE = /~0[0-9a-f]{10,}/gi;
+  let wakeWatch = false;
+  let lastSearchFetch = 0;
 
-    try {
-      await status('Reading results…');
-      await waitForResults();
+  function publishChecked(jobs) {
+    const checkedJobs = jobs.filter((job) => job.checked === true || job.checkError);
+    if (!checkedJobs.length) return null;
+    return chrome.runtime.sendMessage({ action: 'leads:ingest', jobs: checkedJobs });
+  }
 
-      // Ask the page-context script to re-read the hydrated store, then merge
-      // the DOM pass over the top.
-      window.postMessage({ type: 'UPWORK_SEARCH_RESCAN' }, '*');
-      await sleep(400);
+  function stubsFromHtml(html) {
+    const out = [];
+    const seen = new Set();
+    CIPHER_ID_RE.lastIndex = 0;
+    let match;
+    while ((match = CIPHER_ID_RE.exec(html))) {
+      const id = match[0];
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push({
+        id,
+        url: `https://www.upwork.com/jobs/${id}`,
+        title: 'New job',
+        description: '',
+      });
+    }
+    return out;
+  }
 
-      const domRows = scrapeDom();
-      domRows.forEach(mergeJob);
+  async function rememberSeen(ids, primed) {
+    if (stopRequested) return;
+    const { leadsWatch } = await chrome.storage.local.get('leadsWatch');
+    const prev = leadsWatch || {};
+    if (stopRequested || prev.active !== true) return;
+    await chrome.storage.local.set({
+      leadsWatch: {
+        active: true,
+        phase: 'live',
+        primed: primed === true || prev.primed === true,
+        startedAt: prev.startedAt || Date.now(),
+        seenIds: [...ids].slice(-4000),
+      },
+    });
+  }
 
-      // The DOM is the only reliable answer to "what is on *this* page" —
-      // Upwork pages the results client-side, so `captured` still holds
-      // everything from earlier pages in the same document.
-      const onPage = new Set(domRows.map((r) => r.id));
-      let jobs = [...captured.values()].filter((j) => onPage.has(j.id));
+  async function collectJobStubs() {
+    window.postMessage({ type: 'UPWORK_SEARCH_RESCAN' }, '*');
+    await sleep(300);
+    const byId = new Map();
+    scrapeDom().forEach((job) => byId.set(job.id, job));
+    captured.forEach((job, id) => { if (!byId.has(id)) byId.set(id, job); });
 
-      // Markup we couldn't read, but the page's own JSON came through.
-      if (!jobs.length && captured.size) jobs = [...captured.values()];
+    if (Date.now() - lastSearchFetch > 15000) {
+      lastSearchFetch = Date.now();
+      try {
+        const res = await fetch(location.href, { credentials: 'include', headers: { accept: 'text/html' } });
+        if (res.ok) {
+          const html = await res.text();
+          if (!/just a moment|cdn-cgi\/challenge/i.test(html)) {
+            stubsFromHtml(html).forEach((job) => { if (!byId.has(job.id)) byId.set(job.id, job); });
+          }
+        }
+      } catch { /* the tiles already collected are enough for this pass */ }
+    }
+    return [...byId.values()];
+  }
 
-      if (!jobs.length) {
-        const links = jobLinks().length;
-        await setState({
-          active: false,
-          found: 0,
-          error: links
-            ? `Found ${links} job link${links === 1 ? '' : 's'} but couldn't read the tiles. Upwork's layout may have changed.`
-            : 'No job results on this page. Scroll until the listings appear, then try again.',
-        });
+  async function waitForSignal(ms) {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (stopRequested || wakeWatch) {
+        wakeWatch = false;
         return;
       }
+      await sleep(400);
+    }
+  }
 
-      // Every job gets visited now, not just the ones with a clipped snippet:
-      // the work history and attachments only exist on the job page, so
-      // skipping the fetch loses them even when the description looks whole.
-      if (enrich && jobs.length) await enrichAll(jobs, status, readAttachmentsEnabled);
+  // Jobs already on screen when Start is clicked are the baseline. Only an id
+  // that appears after that gets opened and reviewed.
+  async function watchLive() {
+    if (scraping) return;
+    scraping = true;
+    stopRequested = false;
+    const status = (message) => setState({ active: true, watching: true, message });
+    try {
+      await waitForResults(8000);
+      const { leadsWatch } = await chrome.storage.local.get('leadsWatch');
+      const seen = new Set((leadsWatch && leadsWatch.seenIds) || []);
+      if (!leadsWatch || !leadsWatch.primed) {
+        (await collectJobStubs()).forEach((job) => seen.add(job.id));
+        await rememberSeen(seen, true);
+        await status('Waiting for a new job…');
+      }
 
-      await status(`Saving ${jobs.length} job${jobs.length === 1 ? '' : 's'}…`);
-      const reply = await chrome.runtime.sendMessage({ action: 'leads:ingest', jobs });
-      const added = reply && reply.added != null ? reply.added : null;
-
-      await setState({
-        active: false,
-        found: jobs.length,
-        added,
-        message: added == null
-          ? `Saved ${jobs.length} job${jobs.length === 1 ? '' : 's'}.`
-          : `${jobs.length} job${jobs.length === 1 ? '' : 's'} on this page · ${added} new.`,
-      });
+      while (!stopRequested) {
+        const fresh = (await collectJobStubs()).filter((job) => !seen.has(job.id));
+        if (!fresh.length) {
+          await status('Waiting for a new job…');
+          await waitForSignal(6000);
+          continue;
+        }
+        fresh.forEach((job) => seen.add(job.id));
+        await rememberSeen(seen, true);
+        await status(`Reviewing ${fresh.length} new job${fresh.length === 1 ? '' : 's'}…`);
+        const blocked = await enrichAll(fresh, status);
+        await publishChecked(fresh);
+        if (stopRequested) break;
+        await status(blocked
+          ? 'Upwork blocked a check. Still waiting for a new job…'
+          : 'Waiting for a new job…');
+        await waitForSignal(blocked ? 30000 : 4000);
+      }
     } catch (err) {
-      await setState({ active: false, error: String(err && err.message ? err.message : err) });
+      if (!stopRequested) {
+        await setState({
+          active: true,
+          watching: true,
+          error: String(err && err.message ? err.message : err),
+          message: 'Waiting to retry…',
+        });
+      }
     } finally {
       scraping = false;
+      if (stopRequested) await setState({ active: false, watching: false, message: 'Stopped.' });
     }
   }
 
@@ -572,6 +672,7 @@
   window.addEventListener('message', (e) => {
     if (e.source !== window || !e.data || e.data.type !== CHANNEL) return;
     (e.data.jobs || []).forEach(mergeJob);
+    if (e.data.jobs && e.data.jobs.length) wakeWatch = true;
   });
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -584,10 +685,26 @@
     }
     if (msg.action === 'leads:scrapePage') {
       if (scraping) { sendResponse({ ok: true, alreadyRunning: true }); return; }
-      scrapePage(!!msg.enrich, msg.readAttachments !== false);
+      watchLive();
       sendResponse({ ok: true, started: true });
     }
+    if (msg.action === 'leads:watchTick') {
+      if (scraping) { sendResponse({ ok: true, alreadyRunning: true }); return; }
+      watchLive();
+      sendResponse({ ok: true, started: true });
+    }
+    if (msg.action === 'leads:stopWatch') {
+      stopRequested = true;
+      sendResponse({ ok: true });
+    }
   });
+
+  setTimeout(() => {
+    chrome.storage.local.get('leadsWatch', ({ leadsWatch }) => {
+      if (!leadsWatch || !leadsWatch.active || scraping) return;
+      watchLive();
+    });
+  }, 700);
 
   const script = document.createElement('script');
   script.src = chrome.runtime.getURL('search-injected.js');

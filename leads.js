@@ -1,52 +1,23 @@
 'use strict';
 
-// Leads dashboard. Reads everything the service worker wrote to storage and
-// renders it; all mutation goes back through messages so the engine stays the
-// single owner of the pipeline.
+// Results page. A job matches when a freelancer linked from the client's
+// recent history has Vietnam on their profile.
 
-const PROVIDERS = {
-  gemini: {
-    label: 'Google Gemini',
-    models: ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-2.5-pro'],
-    keyUrl: 'https://aistudio.google.com/apikey',
-  },
-  openai: {
-    label: 'OpenAI',
-    models: ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4o'],
-    keyUrl: 'https://platform.openai.com/api-keys',
-  },
-};
+const DEFAULT_SEARCH_URL =
+  'https://www.upwork.com/nx/search/jobs?amount=5000-' +
+  '&category2_uid=531770282580668420,531770282580668419,531770282580668418' +
+  '&nav_dir=pop&per_page=50&q=%2F&sort=recency&t=0,1';
 
-// Mirrors DEFAULT_LEADS_CONFIG in leads-engine.js — the worker owns the real
-// defaults, these keep the settings form from rendering blank before the first
-// save.
-const DEFAULT_CONFIG = {
-  provider: 'gemini',
-  geminiKey: '',
-  openaiKey: '',
-  model: '',
-  searchUrl:
-    'https://www.upwork.com/nx/search/jobs?amount=5000-' +
-    '&category2_uid=531770282580668420,531770282580668419,531770282580668418' +
-    '&nav_dir=pop&per_page=50&q=%2F&sort=recency&t=0,1',
-  batchSize: 8,
-  minConfidence: 0.35,
-  autoAnalyze: true,
-  enrich: true,
-};
-
-let filter = 'leads';
+let filter = 'vietnam';
 let query = '';
 let sortState = { key: 'capturedAt', type: 'date', dir: 'desc' };
-let config = { ...DEFAULT_CONFIG };
-let rows = [];          // jobs decorated with a `_v` view object
-let visible = [];       // rows passing filter + search + sort
+let config = { searchUrl: DEFAULT_SEARCH_URL };
+let rows = [];
+let visible = [];
 let toastTimer = null;
 
-// ─── Helpers ────────────────────────────────────────────────
-
-function escapeHtml(s) {
-  return String(s == null ? '' : s)
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -57,11 +28,11 @@ function timeAgo(ts) {
   if (!ts) return '—';
   const ms = typeof ts === 'number' ? ts : Date.parse(ts);
   if (Number.isNaN(ms)) return '—';
-  const s = Math.floor((Date.now() - ms) / 1000);
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-  return `${Math.floor(s / 86400)}d ago`;
+  const seconds = Math.floor((Date.now() - ms) / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
 }
 
 function toast(text) {
@@ -78,77 +49,55 @@ async function send(action, payload) {
   return reply || {};
 }
 
-/**
- * Flatten a stored job into the shape the table renders. Falls back to the
- * regex pass when the model hasn't seen the job yet, so a plainly visible
- * email shows up immediately rather than after the next analysis run.
- */
-function buildView(job) {
-  const a = job.analysis || null;
-  const local = job.local || { emails: [], links: [] };
-  const emails = a ? a.emails || [] : local.emails || [];
-  const links = a ? a.links || [] : local.links || [];
-  const phones = a ? a.phones || [] : [];
-  const company = (a && a.companyName) || null;
-  const person = (a && a.personName) || null;
+function vietnamPeople(job) {
+  return (job.freelancers || []).filter((person) => person.vietnam);
+}
 
-  return {
-    company,
-    person,
-    emails,
-    phones,
-    links,
-    client: company || person || '',
-    clientSummary: (a && a.clientSummary) || null,
-    jobSummary: (a && a.jobSummary) || '',
-    signals: (a && a.signals) || [],
-    confidence: a ? a.confidence || 0 : (emails.length ? 0.5 : 0),
-    analyzed: job.state === 'done',
-    isLead: a ? !!a.hasClientInfo : emails.length > 0,
-  };
+function isVietnamJob(job) {
+  return job.locationMatch === true || vietnamPeople(job).length > 0;
+}
+
+function otherPeople(job) {
+  return (job.freelancers || []).filter((person) => !person.vietnam);
 }
 
 function passesFilter(job, which = filter) {
-  const v = job._v;
   switch (which) {
-    case 'leads':
-      // An unanalysed job with a literal email in the text still counts.
-      return v.isLead && (!v.analyzed || v.confidence >= config.minConfidence);
-    case 'email': return v.emails.length > 0;
-    case 'company': return !!v.company;
-    case 'attachment': return (job.attachments || []).length > 0;
-    case 'problem': return job.state === 'error' || job.state === 'pending';
+    case 'vietnam': return isVietnamJob(job);
+    case 'empty': return job.checked === true && !(job.freelancers || []).length && !job.locationMatch;
+    case 'failed': return job.checked === false;
     default: return true;
   }
 }
 
 function matchesQuery(job) {
   if (!query) return true;
-  const v = job._v;
-  const haystack = [
-    job.title, v.company, v.person, v.clientSummary, v.jobSummary,
-    v.emails.join(' '), v.links.join(' '),
-  ].join(' ').toLowerCase();
-  return haystack.includes(query);
+  const people = (job.freelancers || [])
+    .map((person) => `${person.name} ${person.location || ''} ${person.country || ''}`)
+    .join(' ');
+  const places = (job.preferredCountries || []).join(' ');
+  return `${job.title} ${people} ${places}`.toLowerCase().includes(query);
 }
 
 function sortValue(job, key, type) {
-  const raw = key === 'client' || key === 'confidence' ? job._v[key] : job[key];
+  const raw = job[key];
   if (raw === null || raw === undefined || raw === '') return null;
-  if (type === 'num') { const n = Number(raw); return Number.isNaN(n) ? null : n; }
-  if (type === 'date') { const ms = typeof raw === 'number' ? raw : Date.parse(raw); return Number.isNaN(ms) ? null : ms; }
+  if (type === 'date') {
+    const ms = typeof raw === 'number' ? raw : Date.parse(raw);
+    return Number.isNaN(ms) ? null : ms;
+  }
   return String(raw).toLowerCase();
 }
 
 function applyView() {
-  let list = rows.filter((j) => passesFilter(j) && matchesQuery(j));
+  let list = rows.filter((job) => passesFilter(job) && matchesQuery(job));
   if (sortState.key) {
     const { key, type, dir } = sortState;
     list = [...list].sort((a, b) => {
       const av = sortValue(a, key, type);
       const bv = sortValue(b, key, type);
       if (av === null && bv === null) return 0;
-      if (av === null) return 1;   // blanks always sink
+      if (av === null) return 1;
       if (bv === null) return -1;
       const cmp = av < bv ? -1 : av > bv ? 1 : 0;
       return dir === 'desc' ? -cmp : cmp;
@@ -157,63 +106,30 @@ function applyView() {
   visible = list;
 }
 
-// ─── Rendering ──────────────────────────────────────────────
+function personChip(person, kind) {
+  const place = person.vietnam
+    ? (person.location || person.country || 'Vietnam')
+    : (person.location || person.country || (person.error ? 'location unread' : 'location unknown'));
+  return `<button type="button" class="contact ${kind}" data-open="${escapeHtml(person.url)}" title="Open ${escapeHtml(person.name)}'s profile"><span>${escapeHtml(person.name)}</span><span class="place">${escapeHtml(place)}</span></button>`;
+}
+
+function peopleCell(people, kind) {
+  if (!people.length) return '<span class="num-nil">—</span>';
+  return `<div class="contacts">${people.slice(0, 4).map((person) => personChip(person, kind)).join('')}</div>`;
+}
 
 function renderSummary() {
-  const leads = rows.filter((j) => j._v.isLead);
-  const emails = new Set();
-  rows.forEach((j) => j._v.emails.forEach((e) => emails.add(e)));
-
+  const matched = rows.filter(isVietnamJob);
   document.getElementById('sumTotal').textContent = rows.length;
-  document.getElementById('sumLeads').textContent = leads.length;
-  document.getElementById('sumEmails').textContent = emails.size;
-  document.getElementById('sumPending').textContent = rows.filter((j) => j.state === 'pending').length;
+  document.getElementById('sumVietnam').textContent = matched.length;
+  document.getElementById('sumLocation').textContent = rows.filter((job) => job.locationMatch).length;
+  document.getElementById('sumFailed').textContent = rows.filter((job) => job.checked === false).length;
 
-  const count = (f) => rows.filter((j) => passesFilter(j, f)).length;
-  document.getElementById('cntLeads').textContent = count('leads');
-  document.getElementById('cntEmail').textContent = count('email');
-  document.getElementById('cntCompany').textContent = count('company');
-  document.getElementById('cntAttachment').textContent = count('attachment');
+  const count = (name) => rows.filter((job) => passesFilter(job, name)).length;
+  document.getElementById('cntVietnam').textContent = count('vietnam');
   document.getElementById('cntAll').textContent = rows.length;
-  document.getElementById('cntProblem').textContent = count('problem');
-}
-
-function contactsCell(v) {
-  const parts = [];
-  for (const email of v.emails.slice(0, 3)) {
-    parts.push(`<button type="button" class="contact email" data-copy="${escapeHtml(email)}" title="Copy ${escapeHtml(email)}"><span>${escapeHtml(email)}</span></button>`);
-  }
-  for (const phone of v.phones.slice(0, 2)) {
-    parts.push(`<button type="button" class="contact phone" data-copy="${escapeHtml(phone)}" title="Copy ${escapeHtml(phone)}"><span>${escapeHtml(phone)}</span></button>`);
-  }
-  for (const link of v.links.slice(0, 2)) {
-    let label = link;
-    try { label = new URL(link.startsWith('http') ? link : `https://${link}`).hostname.replace(/^www\./, ''); } catch { /* keep raw */ }
-    parts.push(`<button type="button" class="contact link" data-copy="${escapeHtml(link)}" title="Copy ${escapeHtml(link)}"><span>${escapeHtml(label)}</span></button>`);
-  }
-  if (!parts.length) return '<span class="num-nil">—</span>';
-  return `<div class="contacts">${parts.join('')}</div>`;
-}
-
-function clientCell(job) {
-  const v = job._v;
-  if (!v.company && !v.person) {
-    if (job.state === 'pending') return '<span class="state-pill pending">queued</span>';
-    if (job.state === 'error') return '<span class="state-pill error">failed</span>';
-    return '<span class="num-nil">—</span>';
-  }
-  const name = v.company
-    ? `<div class="client-name">${escapeHtml(v.company)}</div>`
-    : `<div class="client-name">${escapeHtml(v.person)}</div>`;
-  const person = v.company && v.person ? `<div class="client-person">${escapeHtml(v.person)}</div>` : '';
-  return name + person;
-}
-
-function confidenceCell(v) {
-  if (!v.analyzed) return '<span class="num-nil">—</span>';
-  const pct = Math.round(v.confidence * 100);
-  const cls = pct >= 70 ? 'hi' : pct >= 40 ? 'mid' : 'lo';
-  return `<span class="conf ${cls}">${pct}%</span>`;
+  document.getElementById('cntEmpty').textContent = count('empty');
+  document.getElementById('cntFailed').textContent = count('failed');
 }
 
 function renderTable() {
@@ -233,35 +149,37 @@ function renderTable() {
 
   if (!visible.length) {
     const msg = !rows.length
-      ? 'No jobs collected yet. Click “Collect jobs” to open your Upwork search and scan it.'
+      ? 'No jobs scanned yet. Open an Upwork search and scan it.'
       : query
-        ? 'No leads match your search.'
-        : 'No jobs in this filter.';
-    tbody.innerHTML = `<tr><td colspan="7" class="empty-cell">${msg}</td></tr>`;
+        ? 'No jobs match your search.'
+        : filter === 'vietnam'
+          ? 'No job on this list asks for Vietnam or has a Vietnam freelancer in the client history.'
+          : 'No jobs in this filter.';
+    tbody.innerHTML = `<tr><td colspan="5" class="empty-cell">${msg}</td></tr>`;
     return;
   }
 
   for (const job of visible) {
-    const v = job._v;
     const tr = document.createElement('tr');
     tr.dataset.jobId = job.id;
+    if (isVietnamJob(job)) tr.classList.add('is-match');
 
     const sub = [];
     if (job.budget != null) sub.push(`$${Number(job.budget).toLocaleString()}`);
     else if (job.hourlyRange) sub.push(`$${escapeHtml(job.hourlyRange)}/hr`);
     if (job.postedOn) sub.push(`posted ${timeAgo(job.postedOn)}`);
     if (job.country) sub.push(escapeHtml(job.country));
+    if (job.checked === false) sub.push('not checked');
 
     tr.innerHTML = `
       <td>
         <div class="lead-title" title="${escapeHtml(job.title)}">${escapeHtml(job.title)}</div>
         ${sub.length ? `<div class="lead-sub">${sub.join('<span class="sep">·</span>')}</div>` : ''}
+        ${(job.preferredCountries || []).length ? `<div class="loc-line${job.locationMatch ? ' is-hit' : ''}">Location: ${escapeHtml(job.preferredCountries.join(', '))}</div>` : ''}
       </td>
-      <td>${clientCell(job)}</td>
-      <td>${contactsCell(v)}</td>
-      <td><div class="lead-summary">${escapeHtml(v.clientSummary || v.jobSummary || '')}</div></td>
+      <td>${peopleCell(vietnamPeople(job), 'vietnam')}</td>
+      <td>${peopleCell(otherPeople(job), 'link')}</td>
       <td>${timeAgo(job.capturedAt)}</td>
-      <td class="num">${confidenceCell(v)}</td>
       <td>
         <div class="row-actions">
           <button class="btn icon" data-action="open" title="Open job on Upwork">↗</button>
@@ -272,31 +190,27 @@ function renderTable() {
   }
 }
 
-function renderStatus(run, scrape) {
+function renderStatus(scrape) {
   const pill = document.getElementById('status');
   const text = document.getElementById('statusText');
-  const analysing = run && run.status === 'running';
-  pill.classList.toggle('checking', analysing || !!(scrape && scrape.active));
+  const busy = !!(scrape && scrape.active);
+  pill.classList.toggle('checking', busy);
 
-  if (scrape && scrape.active) {
-    text.textContent = scrape.message || 'Scraping the search page…';
-  } else if (analysing) {
-    text.textContent = run.message || 'Analysing…';
-  } else if (run && run.status === 'error') {
-    text.textContent = 'Analysis stopped';
-  } else if (run && run.message) {
-    text.textContent = run.message;
-  } else {
-    text.textContent = rows.length ? `${rows.length} jobs collected` : 'No jobs yet';
+  if (busy) text.textContent = scrape.message || 'Scanning the search page…';
+  else if (scrape && scrape.error) text.textContent = 'Scan stopped';
+  else if (scrape && scrape.message) text.textContent = scrape.message;
+  else {
+    const matches = rows.filter(isVietnamJob).length;
+    text.textContent = rows.length
+      ? `${matches} Vietnam match${matches === 1 ? '' : 'es'}`
+      : 'No jobs yet';
   }
 }
 
-function renderBanner(run, scrape) {
+function renderBanner(scrape) {
   const banner = document.getElementById('banner');
   const textEl = document.getElementById('bannerText');
   const action = document.getElementById('bannerAction');
-  const activeKey = config.provider === 'openai' ? config.openaiKey : config.geminiKey;
-
   let message = null;
   let actionLabel = null;
   let onAction = null;
@@ -305,20 +219,10 @@ function renderBanner(run, scrape) {
   if (scrape && !scrape.active && scrape.error) {
     message = scrape.error;
     isError = true;
-  } else if (run && run.status === 'error') {
-    message = run.message;
-    isError = true;
-    actionLabel = 'Settings';
-    onAction = openSettings;
-  } else if (!activeKey) {
-    message = `Add a ${PROVIDERS[config.provider].label} API key to pull client names and contact details out of job descriptions.`;
-    actionLabel = 'Add key';
-    onAction = openSettings;
-  } else if (rows.some((j) => j.state === 'pending')) {
-    const n = rows.filter((j) => j.state === 'pending').length;
-    message = `${n} job${n === 1 ? '' : 's'} collected but not analysed yet.`;
-    actionLabel = 'Analyse now';
-    onAction = analyzeNow;
+  } else if (!rows.length) {
+    message = 'Press Start. Each new job is reviewed as Upwork posts it.';
+    actionLabel = 'Start';
+    onAction = scanSearch;
   }
 
   banner.hidden = !message;
@@ -331,19 +235,17 @@ function renderBanner(run, scrape) {
 }
 
 async function render() {
-  const stored = await chrome.storage.local.get(['leadJobs', 'leadsRun', 'leadsScrape', 'leadsConfig']);
-  config = { ...DEFAULT_CONFIG, ...(stored.leadsConfig || {}) };
-  if (!config.model) config.model = PROVIDERS[config.provider].models[0];
-
-  rows = (stored.leadJobs || []).map((job) => ({ ...job, _v: buildView(job) }));
+  const stored = await chrome.storage.local.get(['leadJobs', 'leadsScrape', 'leadsConfig', 'leadsWatch']);
+  config = { searchUrl: DEFAULT_SEARCH_URL, ...(stored.leadsConfig || {}) };
+  rows = stored.leadJobs || [];
   applyView();
   renderSummary();
   renderTable();
-  renderStatus(stored.leadsRun, stored.leadsScrape);
-  renderBanner(stored.leadsRun, stored.leadsScrape);
+  renderStatus(stored.leadsScrape);
+  renderBanner(stored.leadsScrape);
+  const label = document.getElementById('scrapeLabel');
+  if (label) label.textContent = stored.leadsWatch && stored.leadsWatch.active ? 'Stop' : 'Start';
 }
-
-// ─── Actions ────────────────────────────────────────────────
 
 function openJobTab(job) {
   chrome.tabs.create({ url: job.url });
@@ -359,127 +261,85 @@ async function copyToClipboard(text, label) {
 }
 
 function copyVisibleLinks() {
-  // The point of the filter: hand back only the jobs worth contacting.
-  const links = visible.map((j) => j.url);
+  const links = visible.map((job) => job.url);
   if (!links.length) { toast('Nothing to copy'); return; }
   copyToClipboard(links.join('\n'), `Copied ${links.length} job link${links.length === 1 ? '' : 's'}`);
 }
 
 function csvCell(value) {
-  const s = Array.isArray(value) ? value.join(' | ') : String(value == null ? '' : value);
-  return `"${s.replace(/"/g, '""')}"`;
+  const text = Array.isArray(value) ? value.join(' | ') : String(value == null ? '' : value);
+  return `"${text.replace(/"/g, '""')}"`;
 }
 
 function exportCsv() {
   if (!visible.length) { toast('Nothing to export'); return; }
-  const header = ['Title', 'Company', 'Person', 'Emails', 'Phones', 'Links', 'Client summary', 'Job summary', 'Confidence', 'Job URL'];
+  const header = ['Title', 'Job URL', 'Preferred locations', 'Vietnam freelancers', 'Freelancer locations', 'Other freelancers'];
   const lines = [header.map(csvCell).join(',')];
   for (const job of visible) {
-    const v = job._v;
+    const matched = vietnamPeople(job);
+    const others = otherPeople(job);
     lines.push([
-      job.title, v.company, v.person, v.emails, v.phones, v.links,
-      v.clientSummary, v.jobSummary, v.analyzed ? v.confidence.toFixed(2) : '', job.url,
+      job.title,
+      job.url,
+      job.preferredCountries || [],
+      matched.map((person) => person.name),
+      matched.map((person) => person.location || person.country || ''),
+      others.map((person) => `${person.name}${person.location ? ` (${person.location})` : ''}`),
     ].map(csvCell).join(','));
   }
-  // BOM so Excel reads the UTF-8 correctly.
   const blob = new Blob(['\uFEFF', lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `upwork-leads-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.download = `upwork-vietnam-${new Date().toISOString().slice(0, 10)}.csv`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   toast(`Exported ${visible.length} row${visible.length === 1 ? '' : 's'}`);
 }
 
-async function analyzeNow() {
-  toast('Analysing…');
-  try {
-    await send('leads:analyze');
-  } catch (err) {
-    toast(err.message);
-  }
-  render();
+function personLines(people) {
+  if (!people.length) return '<p class="is-muted">None</p>';
+  return `<div class="contacts">${people.map((person) => personChip(person, person.vietnam ? 'vietnam' : 'link')).join('')}</div>`;
 }
 
-// ─── Detail drawer ──────────────────────────────────────────
-
 function openDetail(job) {
-  const v = job._v;
+  const matched = vietnamPeople(job);
   document.getElementById('detailTitle').textContent = job.title;
-  document.getElementById('detailSub').textContent =
-    [v.company, v.person].filter(Boolean).join(' · ') || 'No client identified';
+  document.getElementById('detailSub').textContent = job.locationMatch
+    ? `Asked for ${(job.preferredCountries || []).join(', ')}`
+    : matched.length
+      ? `${matched.map((person) => person.name).join(', ')} in Vietnam`
+      : 'No Vietnam match';
 
-  const body = document.getElementById('detailBody');
   const section = (heading, html) => `<div class="detail-section"><h3>${heading}</h3>${html}</div>`;
-  const chips = (items, cls) => items
-    .map((x) => `<button type="button" class="contact ${cls}" data-copy="${escapeHtml(x)}"><span>${escapeHtml(x)}</span></button>`)
-    .join('');
-
   let html = `
     <div class="detail-actions">
-      <button class="btn primary" data-action="open">Open on Upwork</button>
-      <button class="btn ghost" data-copy="${escapeHtml(job.url)}">Copy link</button>
+      <button class="btn primary" data-action="open">Open job</button>
+      <button class="btn ghost" data-copy="${escapeHtml(job.url)}">Copy job link</button>
     </div>`;
-
-  if (v.emails.length || v.phones.length || v.links.length) {
-    html += section('Contact', `<div class="contacts">${chips(v.emails, 'email')}${chips(v.phones, 'phone')}${chips(v.links, 'link')}</div>`);
+  if ((job.preferredCountries || []).length) {
+    html += section('Preferred location', `<p>${escapeHtml(job.preferredCountries.join(', '))}</p>`);
   }
-  if (v.clientSummary) html += section('Client', `<p>${escapeHtml(v.clientSummary)}</p>`);
-  if (v.jobSummary) html += section('Job summary', `<p>${escapeHtml(v.jobSummary)}</p>`);
-  if (v.signals.length) {
-    html += section('Why it matched', `<div class="signal-list">${v.signals.map((s) => `<span class="signal">${escapeHtml(s)}</span>`).join('')}</div>`);
-  }
-  if (job.state === 'error') html += section('Analysis error', `<p>${escapeHtml(job.error || 'Unknown error')}</p>`);
-  html += section('Job description', `<div class="detail-desc">${escapeHtml(job.description || '')}</div>`);
-  for (const file of job.attachments || []) {
-    const body = file.text
-      ? `<div class="detail-desc">${escapeHtml(file.text)}</div>`
-      : '<p class="is-muted">Couldn\u2019t read this file\u2019s contents \u2014 the filename was still analysed.</p>';
-    html += section(`Attachment: ${escapeHtml(file.name)}`, body);
+  html += section('Vietnam freelancers', personLines(matched));
+  html += section('Other freelancers in the history', personLines(otherPeople(job)));
+  if (job.checked === false) {
+    html += section('Check', `<p>${escapeHtml(job.checkError || 'This job page could not be opened.')}</p>`);
   }
   if (job.clientHistory) {
     html += section("Client's history", `<div class="detail-desc">${escapeHtml(job.clientHistory)}</div>`);
   }
 
+  const body = document.getElementById('detailBody');
   body.innerHTML = html;
   body.querySelector('[data-action="open"]')?.addEventListener('click', () => openJobTab(job));
-
   document.getElementById('detailDrawer').hidden = false;
-  document.body.style.overflow = 'hidden';
 }
 
 function closeDetail() {
   document.getElementById('detailDrawer').hidden = true;
-  if (document.getElementById('settingsModal').hidden) document.body.style.overflow = '';
-}
-
-// ─── Settings ───────────────────────────────────────────────
-
-function fillModels() {
-  const select = document.getElementById('modelSelect');
-  select.innerHTML = '';
-  for (const model of PROVIDERS[config.provider].models) {
-    const opt = document.createElement('option');
-    opt.value = model;
-    opt.textContent = model;
-    select.appendChild(opt);
-  }
-  select.value = PROVIDERS[config.provider].models.includes(config.model)
-    ? config.model
-    : PROVIDERS[config.provider].models[0];
 }
 
 function fillSettings() {
-  document.querySelector(`#providerChoice input[value="${config.provider}"]`).checked = true;
-  document.getElementById('apiKey').value =
-    config.provider === 'openai' ? config.openaiKey : config.geminiKey;
-  document.getElementById('keyHelp').href = PROVIDERS[config.provider].keyUrl;
-  document.getElementById('batchSize').value = config.batchSize;
-  document.getElementById('minConfidence').value = config.minConfidence;
-  document.getElementById('autoAnalyze').checked = !!config.autoAnalyze;
   document.getElementById('searchUrl').value = config.searchUrl || '';
-  document.getElementById('verifyResult').textContent = '';
-  fillModels();
 }
 
 async function saveConfig(patch) {
@@ -491,27 +351,30 @@ async function saveConfig(patch) {
 function openSettings() {
   fillSettings();
   document.getElementById('settingsModal').hidden = false;
-  document.body.style.overflow = 'hidden';
 }
 
 function closeSettings() {
   document.getElementById('settingsModal').hidden = true;
-  if (document.getElementById('detailDrawer').hidden) document.body.style.overflow = '';
   render();
 }
 
-// ─── Wiring ─────────────────────────────────────────────────
-
-document.getElementById('scrapeSearch').addEventListener('click', async () => {
-  toast('Starting…');
+async function scanSearch() {
+  const { leadsWatch } = await chrome.storage.local.get('leadsWatch');
   try {
-    const reply = await send('leads:scrapeSearch', { enrich: config.enrich !== false });
-    toast(reply.opened ? 'Opened your job search — scraping once it loads' : 'Scraping the search page');
+    if (leadsWatch && leadsWatch.active) {
+      await send('leads:watchStop');
+      toast('Stopped');
+      return;
+    }
+    toast('Starting…');
+    const reply = await send('leads:scrapeSearch');
+    toast(reply.opened ? 'Opened your job search' : 'Waiting for a new job');
   } catch (err) {
     toast(err.message);
   }
-});
-document.getElementById('analyzeNow').addEventListener('click', analyzeNow);
+}
+
+document.getElementById('scrapeSearch').addEventListener('click', scanSearch);
 document.getElementById('openSettings').addEventListener('click', openSettings);
 document.getElementById('copyLinks').addEventListener('click', copyVisibleLinks);
 document.getElementById('exportCsv').addEventListener('click', exportCsv);
@@ -520,7 +383,7 @@ document.getElementById('filters').addEventListener('click', (e) => {
   const chip = e.target.closest('.chip');
   if (!chip) return;
   filter = chip.dataset.filter;
-  document.querySelectorAll('#filters .chip').forEach((c) => c.classList.toggle('active', c === chip));
+  document.querySelectorAll('#filters .chip').forEach((item) => item.classList.toggle('active', item === chip));
   applyView();
   renderTable();
 });
@@ -536,32 +399,35 @@ document.querySelector('.leads-table thead').addEventListener('click', (e) => {
   if (!th) return;
   const key = th.dataset.sort;
   const type = th.dataset.type || 'str';
-  const numericFirst = type === 'num' || type === 'date';
-  if (sortState.key !== key) sortState = { key, type, dir: numericFirst ? 'desc' : 'asc' };
+  if (sortState.key !== key) sortState = { key, type, dir: type === 'date' ? 'desc' : 'asc' };
   else sortState.dir = sortState.dir === 'asc' ? 'desc' : 'asc';
   applyView();
   renderTable();
 });
 
-// One delegated handler for the table: copy chips win over the row's drawer.
 document.getElementById('leadsBody').addEventListener('click', (e) => {
-  const copyBtn = e.target.closest('[data-copy]');
-  if (copyBtn) {
+  const profile = e.target.closest('[data-open]');
+  if (profile) {
     e.stopPropagation();
-    copyToClipboard(copyBtn.dataset.copy, 'Copied');
+    chrome.tabs.create({ url: profile.dataset.open });
     return;
   }
   const tr = e.target.closest('tr[data-job-id]');
   if (!tr) return;
-  const job = rows.find((j) => j.id === tr.dataset.jobId);
+  const job = rows.find((item) => item.id === tr.dataset.jobId);
   if (!job) return;
   if (e.target.closest('[data-action="open"]')) openJobTab(job);
   else openDetail(job);
 });
 
 document.getElementById('detailBody').addEventListener('click', (e) => {
+  const profile = e.target.closest('[data-open]');
+  if (profile) {
+    chrome.tabs.create({ url: profile.dataset.open });
+    return;
+  }
   const copyBtn = e.target.closest('[data-copy]');
-  if (copyBtn) copyToClipboard(copyBtn.dataset.copy, 'Copied');
+  if (copyBtn) copyToClipboard(copyBtn.dataset.copy, 'Copied job link');
 });
 
 document.getElementById('settingsModal').addEventListener('click', (e) => {
@@ -577,72 +443,20 @@ document.addEventListener('keydown', (e) => {
   else if (!document.getElementById('settingsModal').hidden) closeSettings();
 });
 
-document.getElementById('providerChoice').addEventListener('change', async (e) => {
-  if (e.target.name !== 'provider') return;
-  // Keys are kept per provider so switching back and forth doesn't lose them.
-  await saveConfig({ provider: e.target.value, model: PROVIDERS[e.target.value].models[0] });
-  fillSettings();
-});
-
-// On `input`, not `change`: closing the dialog with Escape never blurs the
-// field, and a key the user typed but didn't save is a confusing failure.
-document.getElementById('apiKey').addEventListener('input', (e) => {
-  const key = e.target.value.trim();
-  saveConfig(config.provider === 'openai' ? { openaiKey: key } : { geminiKey: key });
-});
-
-document.getElementById('modelSelect').addEventListener('change', (e) => saveConfig({ model: e.target.value }));
-document.getElementById('autoAnalyze').addEventListener('change', (e) => saveConfig({ autoAnalyze: e.target.checked }));
-document.getElementById('searchUrl').addEventListener('change', (e) => saveConfig({ searchUrl: e.target.value.trim() }));
-document.getElementById('batchSize').addEventListener('change', (e) => {
-  const n = Math.max(1, Math.min(20, parseInt(e.target.value, 10) || 8));
-  e.target.value = n;
-  saveConfig({ batchSize: n });
-});
-document.getElementById('minConfidence').addEventListener('change', (e) => {
-  const n = Math.max(0, Math.min(1, parseFloat(e.target.value)));
-  const value = Number.isNaN(n) ? 0.35 : n;
-  e.target.value = value;
-  saveConfig({ minConfidence: value });
-});
-
-document.getElementById('verifyKey').addEventListener('click', async () => {
-  const el = document.getElementById('verifyResult');
-  el.className = 'verify-result';
-  el.textContent = 'Testing…';
-  // Use whatever is in the box right now, even if it hasn't blurred yet.
-  const key = document.getElementById('apiKey').value.trim();
-  const patch = config.provider === 'openai' ? { openaiKey: key } : { geminiKey: key };
-  await saveConfig({ ...patch, model: document.getElementById('modelSelect').value });
-  try {
-    const { sample } = await send('leads:verifyKey', { config });
-    el.classList.add('ok');
-    el.textContent = sample && sample.emails && sample.emails.length
-      ? `Working — test post resolved to ${sample.emails[0]}`
-      : 'Working';
-  } catch (err) {
-    el.classList.add('bad');
-    el.textContent = err.message;
-  }
-});
-
-document.getElementById('clearAnalyzed').addEventListener('click', async () => {
-  if (!confirm('Clear all extracted results and re-analyse every collected job?')) return;
-  await send('leads:clear', { scope: 'analyzed' });
-  toast('Queued for re-analysis');
-  render();
+document.getElementById('searchUrl').addEventListener('change', (e) => {
+  saveConfig({ searchUrl: e.target.value.trim() });
 });
 
 document.getElementById('clearAll').addEventListener('click', async () => {
-  if (!confirm('Delete every collected job and its results? This cannot be undone.')) return;
-  await send('leads:clear', { scope: 'all' });
-  toast('Leads deleted');
+  if (!confirm('Delete every scanned job? This cannot be undone.')) return;
+  await send('leads:clear');
+  toast('Jobs deleted');
   render();
 });
 
 chrome.storage.onChanged.addListener((changes, ns) => {
   if (ns !== 'local') return;
-  if (changes.leadJobs || changes.leadsRun || changes.leadsScrape || changes.leadsConfig) render();
+  if (changes.leadJobs || changes.leadsScrape || changes.leadsConfig || changes.leadsWatch) render();
 });
 
 render();
