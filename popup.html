@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d0f10;
+      --surface: #14171a;
+      --surface2: #1b1f23;
+      --surface3: #262b30;
+      --border: #23282d;
+      --border-soft: #1c2126;
+      --text: #e7eaec;
+      --muted: #838d94;
+      --muted2: #5b646b;
+      --accent: #24c46a;
+      --accent-dim: #1ea75a;
+      --warn: #f0a93a;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      width: 320px;
+      margin: 0;
+      font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+      font-size: 13px;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    header img { width: 30px; height: 30px; display: block; flex: none; }
+    .brand-text { display: flex; flex-direction: column; line-height: 1.2; }
+    .brand-name { font-size: 14px; font-weight: 700; }
+    .brand-sub { font-size: 11px; color: var(--muted); }
+
+    section { padding: 12px 14px; }
+
+    .row { display: flex; gap: 8px; }
+
+    button {
+      font-family: inherit;
+      font-size: 12.5px;
+      font-weight: 600;
+      padding: 9px 12px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      background: var(--accent);
+      color: #06210f;
+      transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+    }
+    button:hover { background: var(--accent-dim); }
+    button.secondary {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    button.secondary:hover { background: var(--surface3); border-color: #313941; }
+    button:disabled { opacity: 0.55; cursor: default; }
+
+    label.toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+      cursor: pointer;
+      line-height: 1.3;
+      color: var(--muted);
+    }
+    label.toggle input { accent-color: var(--accent); }
+
+    .status {
+      margin-top: 10px;
+      font-size: 11.5px;
+      line-height: 1.45;
+      color: var(--muted);
+      min-height: 17px;
+    }
+    .status.busy { color: var(--accent); }
+    .status.bad { color: var(--warn); }
+  </style>
+</head>
+<body>
+  <header>
+    <img src="icons/icon128.png" alt="" />
+    <div class="brand-text">
+      <span class="brand-name">Client Lead Finder</span>
+      <span class="brand-sub">Upwork job search</span>
+    </div>
+  </header>
+
+  <section>
+    <div class="row">
+      <button id="scrapePage" style="flex:1;">Scrape this page</button>
+      <button id="openLeads" class="secondary">Leads</button>
+    </div>
+    <label class="toggle">
+      <input type="checkbox" id="leadsEnrich" />
+      Read full job descriptions
+    </label>
+    <label class="toggle">
+      <input type="checkbox" id="leadsAttachments" />
+      Read attached documents
+    </label>
+    <div class="status" id="leadStatus"></div>
+  </section>
+
+  <script src="popup.js"></script>
+</body>
+</html>

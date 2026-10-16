@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Client Lead Finder</title>
+  <link rel="stylesheet" href="app.css" />
+  <link rel="stylesheet" href="leads.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-logo">
+        <img src="icons/icon128.png" alt="" width="38" height="38" />
+      </span>
+      <div class="brand-text">
+        <span class="brand-name">Client Leads</span>
+        <span class="brand-sub">Upwork job search · contact extraction</span>
+      </div>
+    </div>
+
+    <div class="topbar-right">
+      <span class="status-pill" id="status">
+        <span class="live-dot"></span><span id="statusText">—</span>
+      </span>
+      <button id="openSettings" class="icon-btn" title="Settings" aria-label="Settings">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <line x1="4" y1="8" x2="20" y2="8"/><circle cx="9" cy="8" r="2.4" fill="var(--surface)"/>
+          <line x1="4" y1="16" x2="20" y2="16"/><circle cx="15" cy="16" r="2.4" fill="var(--surface)"/>
+        </svg>
+      </button>
+      <button id="analyzeNow" class="btn ghost">Analyse pending</button>
+      <button id="scrapeSearch" class="btn primary" title="Scrape the job search page you have open">
+        <svg class="btn-ico" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        Scrape search page
+      </button>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="summary">
+      <div class="card">
+        <div class="card-label">Jobs collected</div>
+        <div class="card-value" id="sumTotal">0</div>
+      </div>
+      <div class="card">
+        <div class="card-label">With client info</div>
+        <div class="card-value is-accent" id="sumLeads">0</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Emails found</div>
+        <div class="card-value is-accent" id="sumEmails">0</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Awaiting analysis</div>
+        <div class="card-value is-muted" id="sumPending">0</div>
+      </div>
+    </section>
+
+    <div class="banner" id="banner" hidden>
+      <span id="bannerText"></span>
+      <button type="button" class="banner-act" id="bannerAction"></button>
+    </div>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div class="tabs" id="filters" role="group" aria-label="Filter leads">
+          <button type="button" class="chip active" data-filter="leads">Leads <span class="chip-count" id="cntLeads">0</span></button>
+          <button type="button" class="chip" data-filter="email">Has email <span class="chip-count" id="cntEmail">0</span></button>
+          <button type="button" class="chip" data-filter="company">Named company <span class="chip-count" id="cntCompany">0</span></button>
+          <button type="button" class="chip" data-filter="attachment">Has attachment <span class="chip-count" id="cntAttachment">0</span></button>
+          <button type="button" class="chip" data-filter="all">All jobs <span class="chip-count" id="cntAll">0</span></button>
+          <button type="button" class="chip" data-filter="problem">Needs retry <span class="chip-count" id="cntProblem">0</span></button>
+        </div>
+        <div class="panel-head-right">
+          <span class="result-count" id="resultCount"></span>
+          <button type="button" class="btn ghost" id="copyLinks" title="Copy the job links in the current view">Copy links</button>
+          <button type="button" class="btn ghost" id="exportCsv" title="Download the current view as CSV">Export CSV</button>
+          <div class="search-wrap">
+            <svg class="search-ico" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            </svg>
+            <input type="search" id="leadSearch" class="search" placeholder="Search jobs, companies, emails…" />
+          </div>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="jobs-table leads-table" id="leadsTable">
+          <colgroup>
+            <col style="width:265px" /> <!-- Job -->
+            <col style="width:168px" /> <!-- Client -->
+            <col style="width:215px" /> <!-- Contacts -->
+            <col />                     <!-- Summary — takes the slack -->
+            <col style="width:82px" />  <!-- Found -->
+            <col style="width:62px" />  <!-- Confidence -->
+            <col style="width:56px" />  <!-- Actions -->
+          </colgroup>
+          <thead>
+            <tr>
+              <th class="sortable" data-sort="title" data-type="str">Job</th>
+              <th class="sortable" data-sort="client" data-type="str">Client</th>
+              <th>Contacts</th>
+              <th>Summary</th>
+              <th class="sortable" data-sort="capturedAt" data-type="date">Found</th>
+              <th class="sortable num" data-sort="confidence" data-type="num">Conf</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="leadsBody">
+            <tr><td colspan="7" class="empty-cell">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <!-- ─── Settings ─────────────────────────────────────────── -->
+  <div id="settingsModal" class="modal" hidden>
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <div class="modal-header">
+        <h2 id="settingsTitle">Settings</h2>
+        <button type="button" class="icon-btn modal-close" data-close aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <section class="modal-section">
+          <h3>Model</h3>
+          <div class="field-row" id="providerChoice">
+            <label class="radio"><input type="radio" name="provider" value="gemini" /> Google Gemini</label>
+            <label class="radio"><input type="radio" name="provider" value="openai" /> OpenAI</label>
+          </div>
+
+          <label class="field">
+            <span class="field-label">API key <a id="keyHelp" href="#" target="_blank" rel="noreferrer">get one</a></span>
+            <input type="password" id="apiKey" class="search field-input" placeholder="Paste your API key" autocomplete="off" spellcheck="false" />
+          </label>
+          <p class="field-note">Stored unencrypted in this browser profile's extension storage, and sent only to the provider you pick.</p>
+
+          <label class="field">
+            <span class="field-label">Model</span>
+            <select id="modelSelect" class="select field-input"></select>
+          </label>
+
+          <div class="field-row">
+            <button type="button" class="btn ghost" id="verifyKey">Test key</button>
+            <span class="verify-result" id="verifyResult"></span>
+          </div>
+        </section>
+
+        <section class="modal-section">
+          <h3>Analysis</h3>
+          <label class="field">
+            <span class="field-label">Jobs per request <span class="field-hint">fewer = more accurate, more calls</span></span>
+            <input type="number" id="batchSize" class="search field-input" min="1" max="20" />
+          </label>
+          <label class="field">
+            <span class="field-label">Minimum confidence <span class="field-hint">hides weaker matches from the Leads tab</span></span>
+            <input type="number" id="minConfidence" class="search field-input" min="0" max="1" step="0.05" />
+          </label>
+          <div class="toggles">
+            <label><input type="checkbox" id="autoAnalyze" /> Analyse automatically as jobs are collected</label>
+          </div>
+        </section>
+
+        <section class="modal-section">
+          <h3>Search</h3>
+          <label class="field">
+            <span class="field-label">Search URL <span class="field-hint">opened by “Collect jobs”</span></span>
+            <input type="text" id="searchUrl" class="search field-input" spellcheck="false" />
+          </label>
+        </section>
+
+        <section class="modal-section">
+          <h3>Stored data</h3>
+          <div class="field-row">
+            <button type="button" class="btn ghost" id="clearAnalyzed">Re-analyse everything</button>
+            <button type="button" class="btn danger" id="clearAll">Delete all leads</button>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Lead detail ──────────────────────────────────────── -->
+  <div id="detailDrawer" class="drawer" hidden>
+    <div class="drawer-backdrop" data-close></div>
+    <aside class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
+      <div class="drawer-header">
+        <div class="drawer-title-wrap">
+          <h2 id="detailTitle">Lead</h2>
+          <span class="drawer-sub" id="detailSub"></span>
+        </div>
+        <button type="button" class="icon-btn drawer-close" data-close aria-label="Close">&times;</button>
+      </div>
+      <div class="drawer-body" id="detailBody"></div>
+    </aside>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="leads.js"></script>
+</body>
+</html>
